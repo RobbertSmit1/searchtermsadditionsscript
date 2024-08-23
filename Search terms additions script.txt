@@ -1,0 +1,158 @@
+// © 2019-2024
+// developed by Robbert Smit, https://www.linkedin.com/in/robbsmit/
+// This script looks at search queries with more than X conversions in a set lookback period and then adds them to the ad group where the search term was triggered if the search term is not added as a keyword anywhere else in your Google Ads account
+// Note1: if you are working with ad group names or campaign names segmented by match type, you can use the configuration for ad group name. For instance, if you only want exact to be added to exact match ad groups, you'd set var INCLUDE_ADGROUP_NAME_CONTAINS = "exact". Next, you can set var MATCH_TYPE = "EXACT"
+// Note2 only works on account-level and ALWAYS use preview mode to see the changes the script would apply before running or scheduling
+// Note3:  The script can be quite heavy as it relies on the densely populated search terms report. In order to avoid running into timeouts, leverage the ad group name or campaign name contains function to segment the script and have it run in parallel. You can still log everything in the same spreadsheet.
+// Note4: if you’re working with DKI, know that these new keywords WILL get inserted
+// Note 5: be mindful of the lookback days and your scheduling. If you set lookback days for 30 and you are running it daily, it’s going to try and add the same search queries — you don’t want that. If you have a lookback window of 30 days, schedule the script monthly. If you have a lookback window of 7 days, schedule it weekly.
+
+var logEntries = [];
+
+function main() {
+  // Set your tresholds here
+  var LOOKBACK_DAYS = 30;
+  var MATCH_TYPE = 'EXACT'; //select what match type you want the queries to be added as
+  var INCLUDE_ADGROUP_NAME_CONTAINS = "";   //filter for ad group name, if no filter it will consider all ad groups
+  var INCLUDE_CAMPAIGN_NAME_CONTAINS = ""; //HIGHLY RECOMMENDED, without campaign filters GAQL will run into limits fast. Filter for campaign name, if no filter it will consider all campaigns
+  var SPREADSHEET_URL = ''; //insert your own spreadsheet URL here, make sure it’s set to public editing
+  var MIN_CONVERSIONS = 1; //set minimum amount of conversions 
+  var CPA_THRESHOLD = null;  //leave null if you don’t want a maximum CPA threshold. Otherwise, set a max CPA threshold e.g. if you set it to 100 it will not add queries as keywords that exceed a CPA of 100
+  var ROAS_THRESHOLD = null; //leave null if you don’t want a minimum ROAS threshold. Otherwise, set a minimum ROAS threshold e.g. if you set it to 0.5 it will not add queries as keywords that have a ROAS lower than 0.5
+  // end of tresholds
+  var dateRange = getDateRange(LOOKBACK_DAYS);
+  var startDate = dateRange.startDate;
+  var endDate = dateRange.endDate;
+
+  var campaigns = AdsApp.campaigns()
+                        .withCondition("Status = ENABLED") //filter only for enabled campaigns, if you want to run it on paused campaigns for some reason change the word ENABLED to PAUSED
+                        .withCondition("AdvertisingChannelType = SEARCH") //filter for search campaigns to not into errors with shopping or pmax campaigns
+                        .get();
+  
+  var adGroupIds = [];
+  var campaignIds = [];
+
+  while (campaigns.hasNext()) {
+    var campaign = campaigns.next();
+    if (INCLUDE_CAMPAIGN_NAME_CONTAINS && !campaign.getName().toLowerCase().includes(INCLUDE_CAMPAIGN_NAME_CONTAINS.toLowerCase())) { 
+      continue;
+    }
+    campaignIds.push(campaign.getId());
+
+    var adGroups = campaign.adGroups()
+                           .withCondition("Status = ENABLED") //filter only for enabled ad groups, if you want to run it on paused ad groups for some reason change the word ENABLED to PAUSED
+                           .withCondition("AdGroupType != SEARCH_DYNAMIC_ADS") //filter our dynamic search ads as we cannot add keywords there
+                           .get();
+
+    while (adGroups.hasNext()) {
+      var adGroup = adGroups.next();
+      if (INCLUDE_ADGROUP_NAME_CONTAINS && !adGroup.getName().toLowerCase().includes(INCLUDE_ADGROUP_NAME_CONTAINS.toLowerCase())) {
+        continue;
+      }
+      adGroupIds.push(adGroup.getId());
+    }
+  }
+
+  if (adGroupIds.length > 0) {
+    //GAQL query that fetches only search terms with view status none, have not been added or excluded
+    var query = ` 
+      SELECT 
+        campaign.name, 
+        search_term_view.ad_group, 
+        search_term_view.search_term, 
+        metrics.clicks, 
+        metrics.conversions, 
+        metrics.conversions_value, 
+        metrics.cost_micros, 
+        metrics.conversions_value_per_cost, 
+        metrics.cost_per_conversion, 
+        search_term_view.status 
+      FROM search_term_view 
+      WHERE search_term_view.status = 'NONE' 
+      AND metrics.conversions > ${MIN_CONVERSIONS - 1} 
+      AND ad_group.id IN (${adGroupIds.join(",")}) 
+      AND segments.date BETWEEN '${startDate}' AND '${endDate}'
+    `;
+
+    var report = AdsApp.report(query);
+    var rows = report.rows();
+    
+    while (rows.hasNext()) {
+      var row = rows.next();
+      var searchTerm = row["search_term_view.search_term"];
+      var conversions = parseFloat(row["metrics.conversions"]);
+      var cost = parseFloat(row["metrics.cost_micros"]) / 1000000; 
+      var conversionValue = parseFloat(row["metrics.conversions_value"]) / 1000000;
+      var roas = parseFloat(row["metrics.conversions_value_per_cost"]); 
+      var cpa = parseFloat(row["metrics.cost_per_conversion"]) / 1000000; 
+
+      // where statements for cpa and roas in GAQL not possible so I added them to be sequenced later
+      if ((CPA_THRESHOLD !== null && cpa > CPA_THRESHOLD) || 
+          (ROAS_THRESHOLD !== null && roas < ROAS_THRESHOLD)) {
+        Logger.log("Did not add keyword: " + searchTerm + " due to CPA (" + cpa + ") or ROAS (" + roas + ") thresholds.");
+        continue;
+      }
+
+      try {
+        var adGroupId = row["search_term_view.ad_group"].split("/").pop(); // Extract numeric ID
+        var adGroup = AdsApp.adGroups().withIds([parseInt(adGroupId)]).get().next(); 
+        adGroup.newKeywordBuilder().withText(formatKeywordText(searchTerm, MATCH_TYPE)).build();
+        Logger.log("Added keyword: " + searchTerm + " to ad group: " + adGroup.getName());
+        logAdditionToSheet(row["campaign.name"], adGroup.getName(), searchTerm, MATCH_TYPE, conversions, cpa.toFixed(2), roas.toFixed(8));
+      } catch (e) {
+        Logger.log("Failed to add keyword: " + searchTerm + " - " + e.message);
+      }
+    }
+  }
+
+  writeLogsToSheet(SPREADSHEET_URL);
+}
+
+function getDateRange(lookbackDays) {
+  var today = new Date();
+  var endDate = formatDate(today);
+  var startDate = new Date(today.getTime() - (lookbackDays * 24 * 60 * 60 * 1000));
+  return {
+    startDate: formatDate(startDate),
+    endDate: endDate
+  };
+}
+//senator, we run ads
+function formatDate(date) {
+  var year = date.getFullYear();
+  var month = (date.getMonth() + 1).toString().padStart(2, '0');
+  var day = date.getDate().toString().padStart(2, '0');
+  return year + "-" + month + "-" + day;
+}
+
+function formatKeywordText(searchTerm, matchType) {
+  switch (matchType) {
+    case 'PHRASE':
+      return "\"" + searchTerm + "\"";
+    case 'EXACT':
+      return "[" + searchTerm + "]";
+    case 'BROAD':
+    default:
+      return searchTerm;
+  }
+}
+
+// Logs
+function logAdditionToSheet(campaignName, adGroupName, keyword, matchType, conversions, cpa, roas) {
+  var dateAdded = new Date().toLocaleDateString();
+  logEntries.push([campaignName, adGroupName, keyword, matchType, conversions, parseFloat(cpa).toFixed(2), parseFloat(roas).toFixed(8), dateAdded]);
+}
+
+// write to google sheets
+function writeLogsToSheet(spreadsheetUrl) {
+  var sheet = SpreadsheetApp.openByUrl(spreadsheetUrl).getActiveSheet();
+
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(["Campaign", "Ad Group", "Keyword", "Match Type", "Conversions", "CPA", "ROAS", "Date Added"]);
+  }
+
+  if (logEntries.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, logEntries.length, logEntries[0].length).setValues(logEntries);
+  }
+}
+

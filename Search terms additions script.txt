@@ -1,4 +1,3 @@
-// © 2019-2024
 // developed by Robbert Smit, https://www.linkedin.com/in/robbsmit/
 // This script looks at search queries with more than X conversions in a set lookback period and then adds them to the ad group where the search term was triggered if the search term is not added as a keyword anywhere else in your Google Ads account
 // Note1: if you are working with ad group names or campaign names segmented by match type, you can use the configuration for ad group name. For instance, if you only want exact to be added to exact match ad groups, you'd set var INCLUDE_ADGROUP_NAME_CONTAINS = "exact". Next, you can set var MATCH_TYPE = "EXACT"
